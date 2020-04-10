@@ -1,19 +1,23 @@
+/****************************************************************************
+ * Copyright (C) 2020 Anthony Rabine
+ * Contact: anthony@rabine.fr
+ * License: MIT, see LICENSE file
+ ****************************************************************************/
+
 #include "GitRepo.h"
 
 #include <string.h>
 
-GitRepo::GitRepo(const std::string &path)
+GitRepo::GitRepo(const std::string &path, bool valid)
     : mRepo(nullptr)
     , mPath(path)
-    , mIsValid(false)
+    , mIsValid(valid)
+    , mEnabled(true)
 {
 
     int error = git_repository_open(&mRepo, path.data());
 
-    if (error == 0)
-    {
-        mIsValid = true;
-    }
+    mIsValid = (error == 0);
 }
 
 GitRepo::~GitRepo()
@@ -201,6 +205,11 @@ static int print_submod(git_submodule *sm, const char *name, void *payload)
 
 int GitRepo::Status()
 {
+    if (!mIsValid)
+    {
+        return -10;
+    }
+
   git_status_list *status;
   struct status_opts o;
 
@@ -243,6 +252,16 @@ show_status:
 
 
   return 0;
+}
+
+bool GitRepo::IsEnabled() const
+{
+    return mEnabled;
+}
+
+void GitRepo::SetEnabled(bool enabled)
+{
+    mEnabled = enabled;
 }
 
 std::string GitRepo::GetPath() const

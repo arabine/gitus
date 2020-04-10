@@ -1,52 +1,8 @@
 /****************************************************************************
-**
-** Copyright (C) 2016 The Qt Company Ltd.
-** Contact: https://www.qt.io/licensing/
-**
-** This file is part of the examples of the Qt Toolkit.
-**
-** $QT_BEGIN_LICENSE:BSD$
-** Commercial License Usage
-** Licensees holding valid commercial Qt licenses may use this file in
-** accordance with the commercial license agreement provided with the
-** Software or, alternatively, in accordance with the terms contained in
-** a written agreement between you and The Qt Company. For licensing terms
-** and conditions see https://www.qt.io/terms-conditions. For further
-** information use the contact form at https://www.qt.io/contact-us.
-**
-** BSD License Usage
-** Alternatively, you may use this file under the terms of the BSD license
-** as follows:
-**
-** "Redistribution and use in source and binary forms, with or without
-** modification, are permitted provided that the following conditions are
-** met:
-**   * Redistributions of source code must retain the above copyright
-**     notice, this list of conditions and the following disclaimer.
-**   * Redistributions in binary form must reproduce the above copyright
-**     notice, this list of conditions and the following disclaimer in
-**     the documentation and/or other materials provided with the
-**     distribution.
-**   * Neither the name of The Qt Company Ltd nor the names of its
-**     contributors may be used to endorse or promote products derived
-**     from this software without specific prior written permission.
-**
-**
-** THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
-** "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
-** LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR
-** A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT
-** OWNER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,
-** SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT
-** LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE,
-** DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY
-** THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
-** (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
-** OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE."
-**
-** $QT_END_LICENSE$
-**
-****************************************************************************/
+ * Copyright (C) 2020 Anthony Rabine
+ * Contact: anthony@rabine.fr
+ * License: MIT, see LICENSE file
+ ****************************************************************************/
 
 #include "window.h"
 
@@ -67,22 +23,59 @@
 #include <QVBoxLayout>
 #include <QMessageBox>
 #include <QFileDialog>
-
+#include <QThreadPool>
+#include <QTimer>
 
 #include "git2.h"
 #include "GitRepo.h"
 
-//! [0]
+
+class GitStatusTask : public QRunnable
+{
+public:
+    explicit GitStatusTask(GitRepo *repo)
+        : mRepo(repo)
+    {
+
+    }
+
+    void run() override
+    {
+        mRepo->Status();
+    }
+
+private:
+    GitRepo *mRepo;
+};
+
+
+class RefreshUiTask : public QRunnable
+{
+public:
+    explicit RefreshUiTask(Window *app)
+        : mApp(app)
+    {
+
+    }
+
+    void run() override
+    {
+        mApp->RefreshList();
+    }
+
+private:
+    Window *mApp;
+};
+
 Window::Window()
 {
     git_libgit2_init();
 
-    GitRepo repo("/home/anthony/git/felun/");
+    QCoreApplication::setOrganizationName("D8S");
+    QCoreApplication::setOrganizationDomain("d8s.eu");
+    QCoreApplication::setApplicationName("Gitus");
 
-    repo.Status();
-
-    fflush(stdout);
-
+    LoadConfiguration();
 
     mMainUi.setupUi(this);
 
@@ -110,9 +103,15 @@ Window::Window()
     trayIcon->show();
 
     setIcon(0);
+    RefreshStatus();
 
     setWindowTitle(tr("Gitus"));
     resize(400, 300);
+
+    connect(&mTimer, &QTimer::timeout, this, QOverload<>::of(&Window::RefreshStatus));
+
+    mTimer.setInterval(2000);
+    mTimer.start();
 }
 
 Window::~Window()
@@ -120,26 +119,61 @@ Window::~Window()
      git_libgit2_shutdown();
 }
 
+void Window::LoadConfiguration()
+{
+    int size = mSettings.beginReadArray("repos");
+    for (int i = 0; i < size; ++i)
+    {
+        mSettings.setArrayIndex(i);
+        QString dirPath = mSettings.value("path").toString();
+        QDir dir(dirPath);
+        GitRepo *repo = new GitRepo(std::string(dirPath.toLocal8Bit()), dir.exists());
+
+        repo->SetEnabled(mSettings.value("enabled").toBool());
+
+        mRepoList.push_back(repo);
+    }
+    mSettings.endArray();
+}
+
+void Window::SaveConfiguration()
+{
+    mSettings.beginWriteArray("repos");
+    int i = 0;
+    for (const auto rep : mRepoList)
+    {
+        mSettings.setArrayIndex(i++);
+        mSettings.setValue("path", QString(rep->GetPath().data()));
+        mSettings.setValue("enabled", rep->IsEnabled());
+    }
+    mSettings.endArray();
+}
+
 void Window::chooseDirectory()
 {
-    QString dir = QFileDialog::getExistingDirectory(this, tr("Open Directory"),
+    QString dirPath = QFileDialog::getExistingDirectory(this, tr("Open Directory"),
                                                     "/home",
                                                     QFileDialog::ShowDirsOnly | QFileDialog::DontResolveSymlinks);
+    QDir dir(dirPath);
+    if (dir.exists())
+    {
+        mMutex.lock();
+        mRepoList.push_back(new GitRepo(std::string(dirPath.toLocal8Bit()), true));
+        SaveConfiguration();
+        mMutex.unlock();
 
-    mRepoList.push_back(new GitRepo(std::string(dir.toLocal8Bit())));
-
-    RefreshList();
+        RefreshList();
+    }
 }
 
 void Window::RefreshList()
 {
+    mMutex.lock();
     mMainUi.tableWidget->setRowCount(mRepoList.size());
 
     int row = 0;
-    for (auto &rep : mRepoList)
+    for (auto rep : mRepoList)
     {
-        rep->Status();
-        fflush(stdout);
         QTableWidgetItem *newItem = new QTableWidgetItem(QString(rep->GetPath().data()));
         mMainUi.tableWidget->setItem(row, 0, newItem);
 
@@ -159,6 +193,25 @@ void Window::RefreshList()
 
         row++;
     }
+    mMutex.unlock();
+}
+
+void Window::RefreshStatus()
+{
+    mTimer.stop();
+    mMutex.lock();
+    for (auto rep : mRepoList)
+    {
+        QThreadPool::globalInstance()->start(new GitStatusTask(rep));
+        rep->Status();
+    }
+
+    QThreadPool::globalInstance()->waitForDone(1500);
+    mMutex.unlock();
+
+     QThreadPool::globalInstance()->start(new RefreshUiTask(this));
+
+    mTimer.start();
 }
 
 
